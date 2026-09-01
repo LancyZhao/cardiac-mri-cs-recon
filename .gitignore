@@ -1,0 +1,16 @@
+# 数据集（公开可下载，见 README 复现步骤）
+data/
+
+# 模型权重（各约 30MB，可由脚本重新训练得到）
+*.pt
+
+# 运行日志
+logs_*.txt
+run_seg_after.sh
+
+# 环境
+.venv/
+__pycache__/
+*.pyc
+
+.DS_Store
