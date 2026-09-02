@@ -14,20 +14,29 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).parent))
-from sampling import cartesian_mask, psnr, ssim  # noqa: E402
+from sampling import (  # noqa: E402
+    body_mask, cartesian_mask, psnr, psnr_masked, ssim, ssim_masked,
+)
 from unet import UNet, count_params  # noqa: E402
 
 
 class ReconSet(Dataset):
-    """按病例列表加载切片；mask 固定，欠采样在 __getitem__ 里即时算。"""
+    """按病例列表加载切片；mask 固定，欠采样在 __getitem__ 里即时算。
+
+    每张切片记住它来自哪个病例（self.case_of[i]），供按病例聚合指标使用——
+    670 张相邻切片高度相关，不是 670 个独立样本，切片间 std 会低估真实方差。
+    """
 
     def __init__(self, slice_dir: Path, case_ids, mask: np.ndarray):
         self.mask = mask
         self.imgs = []
+        self.case_of = []
         for cid in case_ids:
             d = np.load(slice_dir / f"{cid}.npz")
             self.imgs.append(d["img"])
+            self.case_of.extend([cid] * len(d["img"]))
         self.imgs = np.concatenate(self.imgs, axis=0)
+        assert len(self.case_of) == len(self.imgs)
 
     def __len__(self):
         return len(self.imgs)
@@ -46,31 +55,67 @@ def data_consistency(pred: np.ndarray, zf_k: np.ndarray, mask: np.ndarray) -> np
     return np.abs(np.fft.ifft2(np.fft.ifftshift(kp))).astype(np.float32)
 
 
+def _agg(vals, cases):
+    """把逐切片值聚合成两种口径：按切片等权，和先按病例内平均再对病例平均。
+
+    按病例聚合才是有效的不确定性估计——测试集是 6 例 670 张切片，切片间 std
+    衡量的是"不同切片难易度差异"，不是"换一批病人会怎样"。
+    """
+    v = np.asarray(vals, dtype=np.float64)
+    per_case = {}
+    for x, c in zip(v, cases):
+        per_case.setdefault(c, []).append(x)
+    cm = np.array([np.mean(per_case[c]) for c in sorted(per_case)])
+    return {
+        "slice_mean": float(v.mean()), "slice_std": float(v.std()), "n_slices": int(v.size),
+        "case_mean": float(cm.mean()), "case_std": float(cm.std()), "n_cases": int(cm.size),
+        "per_case": {c: float(np.mean(per_case[c])) for c in sorted(per_case)},
+    }
+
+
 @torch.no_grad()
-def evaluate(model, loader, mask, device, with_dc=True):
+def evaluate(model, loader, mask, device, with_dc=True, case_of=None):
+    """两种口径 × 两种聚合。
+
+    口径：full_image（全图，含约 51.5% 近零背景，与已公开数字一致）
+          roi_body （只在 GT 估出的体内区域内算，背景不再稀释 MSE）
+    聚合：slice（670 张等权，旧口径）/ case（6 例，先例内平均）
+    """
     model.eval()
-    acc = {"zf": [[], []], "unet": [[], []], "unet_dc": [[], []]}
+    keys = ("psnr", "ssim", "psnr_roi", "ssim_roi")
+    acc = {m: {k: [] for k in keys} for m in ("zf", "unet", "unet_dc")}
+    cases, i = [], 0
     for zf, gt in loader:
         pred = model(zf.to(device)).clamp(0, 1).cpu().numpy()[:, 0]
         zf_np, gt_np = zf.numpy()[:, 0], gt.numpy()[:, 0]
         for j in range(len(gt_np)):
-            acc["zf"][0].append(psnr(gt_np[j], zf_np[j]))
-            acc["zf"][1].append(ssim(gt_np[j], zf_np[j]))
-            acc["unet"][0].append(psnr(gt_np[j], pred[j]))
-            acc["unet"][1].append(ssim(gt_np[j], pred[j]))
+            g = gt_np[j]
+            bm = body_mask(g)  # 只依赖 GT，不依赖被评估的重建结果
+            variants = {"zf": zf_np[j], "unet": pred[j]}
             if with_dc:
-                zf_k = np.fft.fftshift(np.fft.fft2(gt_np[j])) * mask
-                dc = np.clip(data_consistency(pred[j], zf_k, mask), 0, 1)
-                acc["unet_dc"][0].append(psnr(gt_np[j], dc))
-                acc["unet_dc"][1].append(ssim(gt_np[j], dc))
+                zf_k = np.fft.fftshift(np.fft.fft2(g)) * mask
+                variants["unet_dc"] = np.clip(data_consistency(pred[j], zf_k, mask), 0, 1)
+            for name, im in variants.items():
+                acc[name]["psnr"].append(psnr(g, im))
+                acc[name]["ssim"].append(ssim(g, im))
+                acc[name]["psnr_roi"].append(psnr_masked(g, im, bm))
+                acc[name]["ssim_roi"].append(ssim_masked(g, im, bm))
+            cases.append(case_of[i] if case_of else "all")
+            i += 1
+
     out = {}
-    for k, (ps, ss) in acc.items():
-        if ps:
-            out[k] = {
-                "psnr": float(np.mean(ps)), "psnr_std": float(np.std(ps)),
-                "ssim": float(np.mean(ss)), "ssim_std": float(np.std(ss)),
-                "n": len(ps),
-            }
+    for m, d in acc.items():
+        if not d["psnr"]:
+            continue
+        full = {"psnr": _agg(d["psnr"], cases), "ssim": _agg(d["ssim"], cases)}
+        roi = {"psnr": _agg(d["psnr_roi"], cases), "ssim": _agg(d["ssim_roi"], cases)}
+        out[m] = {
+            # 旧字段保持不变：全图 + 按切片聚合，已公开的数字仍能原样对上
+            "psnr": full["psnr"]["slice_mean"], "psnr_std": full["psnr"]["slice_std"],
+            "ssim": full["ssim"]["slice_mean"], "ssim_std": full["ssim"]["slice_std"],
+            "n": full["psnr"]["n_slices"],
+            "calibers": {"full_image": full, "roi_body": roi},
+        }
     return out
 
 
@@ -106,7 +151,7 @@ def run_ratio(ratio, slice_dir, meta, args, device):
         print(f"  CS{int(ratio*100):02d} ep{ep+1:02d}/{args.epochs} "
               f"L1={hist[-1]:.5f} ({time.time()-t0:.0f}s)", flush=True)
 
-    res = evaluate(model, vl, mask, device)
+    res = evaluate(model, vl, mask, device, case_of=te.case_of)
     torch.save(model.state_dict(), Path(args.out) / f"recon_cs{int(ratio*100)}.pt")
     return {
         "cs_ratio_nominal": ratio, "cs_ratio_actual": actual,
@@ -145,6 +190,7 @@ def main():
 
     print("\n=== 重建结果（测试集 %d 例 / %d 切片，按病例划分）===" %
           (meta["n_cases"]["test"], meta["n_slices"]["test"]))
+    print("全图口径（含约 51.5% 近零背景，与已公开数字一致）")
     print(f"{'CS':>5} {'零填充 PSNR':>13} {'U-Net PSNR':>12} {'U-Net+DC':>10} "
           f"{'零填充 SSIM':>13} {'U-Net SSIM':>12}")
     for k, v in all_res.items():
@@ -152,6 +198,14 @@ def main():
         print(f"{k:>5} {m['zf']['psnr']:>13.2f} {m['unet']['psnr']:>12.2f} "
               f"{m['unet_dc']['psnr']:>10.2f} {m['zf']['ssim']:>13.4f} "
               f"{m['unet']['ssim']:>12.4f}")
+    print("\nROI(体内)口径，按病例聚合 ± 例间 std（审稿人常要求的口径）")
+    print(f"{'CS':>5} {'零填充 PSNR':>18} {'U-Net+DC PSNR':>18} {'U-Net+DC SSIM':>18}")
+    for k, v in all_res.items():
+        r = v["metrics"]["unet_dc"]["calibers"]["roi_body"]
+        z = v["metrics"]["zf"]["calibers"]["roi_body"]
+        print(f"{k:>5} {z['psnr']['case_mean']:>11.2f}±{z['psnr']['case_std']:<5.2f} "
+              f"{r['psnr']['case_mean']:>11.2f}±{r['psnr']['case_std']:<5.2f} "
+              f"{r['ssim']['case_mean']:>11.4f}±{r['ssim']['case_std']:<5.4f}")
 
 
 if __name__ == "__main__":
