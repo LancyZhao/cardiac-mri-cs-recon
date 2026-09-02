@@ -1,0 +1,10 @@
+# 复现环境（版本全部锁定；实测环境为 Python 3.12.13 / macOS arm64 / MPS）
+#
+# 说明：torch 走 MPS 或 CPU 都能跑，只是耗时不同；指标与设备无关的部分已固定
+# seed=0、mask_seed=0。scipy 供 sampling.body_mask() 的形态学运算使用。
+numpy==2.5.2
+scipy==1.18.1
+scikit-image==0.26.0
+torch==2.13.0
+nibabel==5.4.2
+matplotlib==3.11.1
