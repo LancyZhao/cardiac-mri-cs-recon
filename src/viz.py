@@ -154,6 +154,38 @@ def write_tables():
     v0 = next(iter(recon.values()))
     lines.append(f"\n训练配置：U-Net {v0['params_M']:.2f}M 参数，残差输出，L1 损失，"
                  f"Adam lr {v0['lr']}，cosine 退火，{v0['epochs']} epoch，batch {v0['batch']}。")
+    lines.append("\n上表为**全图口径 · 按切片平均**。全图含约 51.5% 近零背景，"
+                 "该口径绝对值系统性偏高——口径对照见下节。")
+
+    cal_p = RES / "recon_metrics_calibers.json"
+    if cal_p.exists():
+        cal = json.loads(cal_p.read_text())
+        lines.append("\n## 指标口径对照（同一批 checkpoint，`src/eval_recon.py`）\n")
+        lines.append("两种口径 × 两种聚合。ROI = GT 阈值 + 形态学估出的体内区域"
+                     "（只依赖 GT，不依赖被评估的重建结果）。")
+        lines.append("\n| CS | 方法 | 全图/切片 | 全图/病例 ± 例间 std | ROI/病例 ± 例间 std | ROI 代价 |")
+        lines.append("|---|---|---|---|---|---|")
+        for k, v in cal.items():
+            for name in ("zf", "unet", "unet_dc"):
+                c = v["metrics"][name]["calibers"]
+                f, r = c["full_image"]["psnr"], c["roi_body"]["psnr"]
+                lines.append(
+                    f"| {k[2:]}% | {name} | {f['slice_mean']:.2f} dB | "
+                    f"{f['case_mean']:.2f} ± {f['case_std']:.2f} | "
+                    f"**{r['case_mean']:.2f} ± {r['case_std']:.2f}** | "
+                    f"{r['case_mean']-f['slice_mean']:+.2f} dB |")
+        lines.append("\n| CS | 方法 | SSIM 全图/切片 | SSIM ROI/病例 ± 例间 std |")
+        lines.append("|---|---|---|---|")
+        for k, v in cal.items():
+            for name in ("zf", "unet_dc"):
+                c = v["metrics"][name]["calibers"]
+                f, r = c["full_image"]["ssim"], c["roi_body"]["ssim"]
+                lines.append(f"| {k[2:]}% | {name} | {f['slice_mean']:.4f} | "
+                             f"**{r['case_mean']:.4f} ± {r['case_std']:.4f}** |")
+        lines.append("\n**换口径后相对结论全部保留**：U-Net 相对零填充的增益仍近乎恒定，"
+                     "DC 的额外收益仍随采样率递增。可外推的是趋势，绝对值只在固定口径下可比。")
+        lines.append("\n`recon_results.json` 的 `psnr_std` 是**切片间**标准差，"
+                     "用它算置信区间会低估不确定性数倍——有效样本量是 6 例而非 670 张切片。")
 
     seg_p = RES / "seg_results.json"
     if seg_p.exists():
@@ -179,11 +211,20 @@ def write_tables():
     lines.append("- MSD 数据是**已重建的幅值图**，不是原始多线圈 k 空间。这里做的是 "
                  "retrospective undersampling（幅值图 FFT 后抽样），没有真实相位与线圈灵敏度信息，"
                  "绝对 PSNR 偏乐观，**不能与 fastMRI 上的论文数字直接比较**。")
+    lines.append("- 偏乐观的第一来源是**相位丢失**：幅值图实数非负，其 k 空间满足共轭对称 "
+                 "`K(-k)=K*(k)`，被抽掉的相位编码行的信息在对称半边仍部分存在，"
+                 "等价于名义采样率对应的**有效采样率更高**；真实复数数据没有这个冗余。")
+    lines.append("- 第二来源是**无采集噪声**：欠采样是纯无噪线性投影，参考图与欠采样图共享同一份"
+                 "噪声实现，噪声退化为确定性信号（DC 投影还会把抽到的行连噪声一起精确放回）。")
     lines.append("- 划分在**病例级**而非切片级。同一病例相邻切片高度相似，"
                  "按切片随机划分会造成测试集泄漏、指标虚高。")
     lines.append("- 欠采样用笛卡尔一维变密度随机（只抽相位编码线，中心保留 ACS），"
                  "对应临床 2D 序列真正能省的时间；二维随机点采样在 2D 序列里物理不可实现。")
-    lines.append("- 单次运行、单一 seed，未做多 seed 重复，Dice/PSNR 的置信区间未估计。")
+    lines.append("- `data_range` 写死 `1.0`：实测只值 **0.03 dB**（670 张测试切片逐片 `max` 中位数 "
+                 "1.0000、`≥0.99` 占 97.2%），既不是水分也不是保守项。SSIM 用 skimage 默认 "
+                 "`win_size=7, gaussian_weights=False`，未对齐 Wang 原论文参数。")
+    lines.append("- 单次运行、单一 seed，未做多 seed 重复；例间 std 已报但仅 6 例，"
+                 "换 `mask_seed` 会改变结果，单个 mask 的数字不能当作该 CS 比率的代表值。")
     (RES / "REPORT.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 
