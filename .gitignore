@@ -3,6 +3,9 @@ data/
 
 # 模型权重（各约 30MB，可由脚本重新训练得到）
 *.pt
+!results/graduation/ista_cs*.pt
+!results/graduation/ista_learnable_cs*.pt
+!results/graduation/ablation/phases_k*/ista_cs20.pt
 
 # 运行日志
 logs_*.txt

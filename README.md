@@ -1,4 +1,66 @@
-# 心脏 MRI 欠采样重建与分割复现实验
+# 心脏 MRI 欠采样重建：U-Net 基线与 ISTA-Net+ 联合采样
+
+## 毕业设计扩展（2026-10-12）
+
+已完成固定/可学习 mask 三档实验及 K=3/6/9/12 深度消融。训练实际发生于
+2026-10-10 至 2026-10-11，不能用任务书中的计划日期替代。
+
+| 方法 | CS10 PSNR / SSIM | CS20 PSNR / SSIM | CS30 PSNR / SSIM |
+|---|---|---|---|
+| U-Net+DC（20轮） | 23.99 / 0.7578 | 28.45 / 0.8742 | 31.77 / 0.9264 |
+| ISTA-Net+ 固定 mask（50轮） | 24.24 / 0.7736 | 30.92 / 0.9223 | 34.17 / 0.9587 |
+| ISTA-Net+ 可学习 mask（50轮） | 27.24 / 0.8533 | 33.04 / 0.9496 | 36.62 / 0.9769 |
+
+这里是全图逐片均值。机器可读报告、ROI病例指标、完整日志、模型和研究图在
+[`results/graduation/`](results/graduation/)，主入口为
+[`REPORT.md`](results/graduation/REPORT.md)。九组模型独立重评估全部通过；
+`reevaluation.json` 保存逐指标及逐病例对照，MPS上最大差异为0。
+发布的是末轮推理checkpoint，完整优化器续训状态另保留在本地毕业设计交付目录。
+
+**解释边界：** U-Net与ISTA不是等训练预算比较。数据为MSD心脏幅值图的回顾性模拟，
+不是原始多线圈k空间。历史调试观察过同一测试划分，属于探索性比较；只有单种子和6例测试。
+学习mask前向严格保持19/38/58条线（包含ACS），STE概率均值不是实际采样率。
+固定展示的la_005第72张切片在CS10上U-Net+DC优于ISTA，平均提升不表示逐片都改善。
+
+```bash
+# 原有数据预处理与U-Net基线见下文；使用项目虚拟环境
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python src/probe_ista.py --help
+
+# 从零重训请使用新目录，避免覆盖公布结果；自动保存epoch状态
+.venv/bin/python src/run_graduation.py --out results/new_run --device mps
+
+# 用公布的九组模型重算指标，不训练；CPU也可用但更慢
+.venv/bin/python src/eval_ista.py --results results/graduation --device mps
+
+# 生成报告与图（还需要results/recon_cs10/20/30.pt三个U-Net权重）
+.venv/bin/python src/report_ista.py --results results/graduation --device mps
+```
+
+`run_ista_ablation.py --kind hard-dc` 会**重新训练**有/无末尾DC的模型，属于可选新实验；
+本论文采用 `report_ista.py` 中同一已训练checkpoint的**推理开关**消融，两者不能混用。
+
+### 实现与复现记录
+
+- `src/ista_net.py`：特征域D/F/阈值/逆F/G残差结构，K9有336,978参数。
+- 所有频谱移位显式指定空间维。二维路径保存复数k空间；快速Cartesian路径保存复数伴随图，
+  后者必须传 `fast_cartesian=True`，不能仅按张量形状猜测含义。
+- 固定mask缓存测量；联合训练在autograd图中动态生成测量，ACS固定，外围top-k + sigmoid STE。
+- `train_ista.py`按epoch保存优化器、调度器、随机状态及数据/源码指纹。恢复要求配置和指纹一致。
+- CS10固定mask前15轮使用二维FFT，随后保留优化器迁移到等价一维实现。迁移记录在checkpoint
+  和结果中。数学等价不意味着浮点轨迹逐比特一致；从零重训不承诺复现全部历史浮点位。
+- `requirements.txt`为实际训练环境；文档依赖单列在`requirements-docs.txt`，不影响训练指纹。
+
+### 论文工具
+
+论文及学校模板保留在用户本地毕业设计目录，不公开学籍材料。
+`fill_thesis_from_report.py`只更新五张数值表，可重复运行，不覆盖人工审阅的分析段落。
+`build_thesis_docx.py`输出可编辑OMML公式与Word目录域；`export_thesis_lo.py`用实际PDF分页回填
+目录缓存并验证稳定。macOS无界面导出使用`src/thesis_fonts.conf`加载本机Word和系统字体；
+字体文件不随仓库分发。`check_thesis.py`核对正文至少15000汉字、引用、图表、公式编号、
+页边距及Word/Markdown数值与实验JSON一致。跨设备重排后需再次更新目录。
+
+以下为2026年8月至9月的U-Net与分割基线记录；分割并非本次ISTA论文的新增实验。
 
 在公开数据集上复现压缩感知 MRI 重建与左心房分割，产出可核验的 PSNR/SSIM/Dice 指标。
 
@@ -42,7 +104,7 @@ SSIM 受背景抬升更严重：CS30 的 U-Net+DC 从 0.9264 掉到 **0.8862**�
 
 **结论层面真正重要的是：相对结论在换口径后全部保留。** U-Net 相对零填充的增益仍近乎恒定
 （ROI 下 +3.22 / +3.39 / +3.03 dB），DC 的额外收益仍随采样率递增（ROI 下 +0.37 / +0.93 / +1.26 dB）。
-所以可外推的是这两条趋势，**绝对值只在本仓库这一套固定口径下可比**。
+这两条趋势在本次口径变化下保留；是否能外推仍需独立数据验证。**绝对值只在本仓库这一套固定口径下可比**。
 
 关于不确定性：`recon_results.json` 里的 `psnr_std` 是**切片间**标准差，用它算置信区间会把
 不确定性低估 **3.5~8.7 倍**——有效样本量是 6 例而不是 670 张切片（CS30 U-Net+DC：
@@ -89,8 +151,7 @@ tar -xf data/Task02_Heart.tar -C data/
 `seg_results.json`、`REPORT.md`、`figures/`。
 
 随机性：`seed=0`、`mask_seed=0` 固定，单次运行。`eval_recon.py` 复用训练时的
-`mask_seed`，否则评估的是另一个采样模式。**注意**：本仓库只有一次提交历史，
-可信度来自"你可以自己重跑"，不是来自开发历史——这是刻意不掩饰的一点。
+`mask_seed`，否则评估的是另一个采样模式。提交记录不能代替独立数值核验。
 
 ## 实验1：K 空间欠采样重建
 
@@ -163,8 +224,7 @@ Dice 作参考。
   泄漏进训练集，指标虚高。
 - 单次运行、单一随机种子，未做多种子重复。例间 std 已报，但 6 例的样本量下它仍是
   粗估；换 `mask_seed` 会改变结果，单个 mask 的数字不能当作该 CS 比率的代表值。
-- 重建网络是纯图像域 U-Net，不是展开式迭代网络（ISTA-Net / PUERT 那一类），也没有
-  联合优化采样轨迹——mask 在这里是固定先验，不参与学习。
+- 本节历史基线是纯图像域U-Net，mask固定；新增ISTA-Net+与联合mask实验见本文开头。
 - ROI mask 由 GT 阈值 + 形态学估出（`sampling.body_mask`），不是解剖学标注；它只依赖
   GT、不依赖被评估的重建结果，避免"用预测结果定义评估区域"。masked-SSIM 的窗口在
   边界处仍会混入背景像素，这个残留偏差没有消除。

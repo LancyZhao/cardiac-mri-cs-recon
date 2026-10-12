@@ -1,0 +1,4 @@
+# Optional paper/Word export, independent from model training.
+python-docx==1.2.0
+pypandoc-binary==1.17
+lxml==6.1.3
